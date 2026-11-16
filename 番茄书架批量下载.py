@@ -35,6 +35,8 @@ import shutil
 import subprocess
 from datetime import datetime
 
+BASE_VERSION = "3.3.1"   # 每次发布递增 0.0.1
+
 HOST = "https://fanqienovel.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -448,6 +450,83 @@ class DownloaderPool:
                 pass
 
 
+# ───────────────────────── 进度显示(原地刷新) ─────────────────────────
+
+_ANSI_OK = None
+_DRAWN = 0        # 当前已绘制的进度行数
+_LAST_PLAIN = 0.0  # 退化模式下上次打印时间
+
+
+def enable_ansi():
+    """启用 Windows 控制台 ANSI 转义; 返回是否可用。"""
+    global _ANSI_OK
+    if _ANSI_OK is not None:
+        return _ANSI_OK
+    _ANSI_OK = False
+    if os.name != "nt":
+        _ANSI_OK = True
+        return _ANSI_OK
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            k.SetConsoleMode(h, mode.value | 0x0004)
+            _ANSI_OK = True
+    except Exception:
+        _ANSI_OK = False
+    return _ANSI_OK
+
+
+def _draw_progress(lines):
+    """原地重绘进度区(不重复刷屏)。lines 为等长行列表。"""
+    global _DRAWN, _LAST_PLAIN
+    if not enable_ansi():
+        # 退化模式(重定向/管道): 限频打印, 避免刷屏
+        now = time.time()
+        if now - _LAST_PLAIN < 30:
+            return
+        _LAST_PLAIN = now
+        for ln in lines:
+            if ln.strip():
+                print(ln)
+        sys.stdout.flush()
+        return
+    out = []
+    if _DRAWN:
+        out.append("\033[%dF" % _DRAWN)
+    for ln in lines:
+        out.append("\033[K" + ln + "\n")
+    if len(lines) < _DRAWN:
+        for _ in range(_DRAWN - len(lines)):
+            out.append("\033[K\n")
+        out.append("\033[%dF" % (_DRAWN - len(lines)))
+    _DRAWN = len(lines)
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def _clear_progress():
+    """清除进度区, 便于打印普通消息。"""
+    global _DRAWN
+    if _DRAWN and enable_ansi():
+        sys.stdout.write("\033[%dF" % _DRAWN)
+        for _ in range(_DRAWN):
+            sys.stdout.write("\033[K\n")
+        sys.stdout.write("\033[%dF" % _DRAWN)
+        sys.stdout.flush()
+    _DRAWN = 0
+
+
+def _emit(msg):
+    """打印一条普通消息(自动避让进度区)。"""
+    _clear_progress()
+    print(msg)
+    sys.stdout.flush()
+
+
 # ───────────────────────── 下载核对 / 报告 ─────────────────────────
 
 def list_instance_book_files(pool):
@@ -741,9 +820,15 @@ def download_group_books(pool, book_ids, fmt):
             unassigned.append(bid)
 
     stall = 0
+    # 书籍序号: book_id -> 显示编号(1开始)
+    slot_of = {}
+    for i, bid in enumerate(book_ids, 1):
+        slot_of[bid] = i
+    # 每本的进度文本(按编号顺序原地刷新)
+    slot_text = {}
+
     while unassigned or running:
-        time.sleep(2)
-        progress_lines = []
+        time.sleep(1.5)
         # 轮询运行中的任务
         for inst_idx in list(running.keys()):
             bid, job_id = running[inst_idx]
@@ -756,16 +841,17 @@ def download_group_books(pool, book_ids, fmt):
                 finished += 1
                 if state == "done":
                     ok += 1
+                    mark = "完成"
                 else:
                     fail += 1
+                    mark = "失败"
                 results[bid] = {
                     "state": state,
                     "title": detail.get("title") or "",
                     "author": detail.get("author") or "",
                 }
-                tag = "完成" if state == "done" else "失败"
-                print(f"    [{tag} {finished}/{total}] {bid} "
-                      f"{detail.get('title') or ''} (实例{inst_idx+1})")
+                slot_text[slot_of[bid]] = (
+                    f"第{slot_of[bid]}本  [{mark}] {detail.get('title') or bid}")
                 del running[inst_idx]
             else:
                 p = detail.get("progress") or {}
@@ -773,8 +859,8 @@ def download_group_books(pool, book_ids, fmt):
                 tot_ch = p.get("chapter_total", 0)
                 pct = (saved / tot_ch * 100) if tot_ch else 0
                 bar = "#" * int(pct // 5)
-                progress_lines.append(
-                    f"    实例{inst_idx+1} {pct:5.1f}% [{bar:<20}] {saved}/{tot_ch}")
+                slot_text[slot_of[bid]] = (
+                    f"第{slot_of[bid]}本 {pct:5.1f}% [{bar:<20}] {saved}/{tot_ch}")
 
         # 补位: 有空闲实例就从队列取新书
         for inst_idx in range(len(pool.instances)):
@@ -786,20 +872,22 @@ def download_group_books(pool, book_ids, fmt):
             got = pool.submit(bid)
             if got[0] is not None:
                 running[got[0]] = [bid, got[1]]
-                print(f"    [提交] {bid} -> 实例{got[0]+1}  "
-                      f"(队列剩余 {len(unassigned)})")
             else:
                 unassigned.insert(0, bid)
                 break   # 实例不可用, 下轮再试
 
-        if progress_lines:
-            print("\n".join(progress_lines))
+        # 原地重绘: 只显示"正在下载"的书, 按书籍编号排序
+        active_slots = sorted(slot_of[running[i][0]] for i in running)
+        lines = []
+        for slot in active_slots:
+            lines.append("    " + slot_text.get(slot, f"第{slot}本  准备中..."))
+        _draw_progress(lines)
 
         # 防死锁: 长时间无任何进展则判失败退出
         if not running and unassigned:
             stall += 1
             if stall >= 5:
-                print("    [!] 连续多次无法提交任务, 剩余书籍标记为失败")
+                _emit("    [!] 连续多次无法提交任务, 剩余书籍标记为失败")
                 for bid in unassigned:
                     results[bid] = {"state": "failed", "title": "", "author": ""}
                     fail += 1
@@ -808,6 +896,9 @@ def download_group_books(pool, book_ids, fmt):
         else:
             stall = 0
 
+    # 收尾: 清掉进度区, 打印汇总
+    _clear_progress()
+    print(f"    下载汇总: 成功 {ok} / 失败 {fail} / 共 {total}")
     return ok, fail, results
 
 
@@ -1242,7 +1333,7 @@ def main():
         settings["format"] = args.format
 
     print("=" * 60)
-    print("番茄书架批量下载器 v3")
+    print(f"番茄书架批量下载器 v{BASE_VERSION}")
     print("=" * 60)
 
     accounts = load_accounts()

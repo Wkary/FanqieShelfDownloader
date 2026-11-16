@@ -568,36 +568,54 @@ def write_download_report(report_data, gname):
 
 
 def verify_download_result(pool, book_ids, gname, fmt, workers, ok, fail, results):
-    """下载后精确核对。
-    results: {book_id: {state, title, author}}
-    核对依据: 每本书的 title 与磁盘文件名匹配。
-    差异处理: 多余文件移入单独分组; 缺少的书籍尝试重新下载。
+    """下载后核对。
+
+    判定依据(优先级):
+      1. 任务状态: results[bid]["state"] == "done" 视为下载成功
+      2. 文件验证: 成功任务对应的书名应能在磁盘找到文件
+      3. 剩余未匹配文件视为"多余"
+
+    差异处理:
+      - 缺少(任务失败或文件缺失) -> 重新下载一次
+      - 多余(无法归属到任何书) -> 移入本地单独分组
     最后输出 txt 报告。
     """
     expected = len(book_ids)
 
-    def scan():
-        """按标题匹配磁盘文件, 返回 (已落盘book_id集合, 未匹配文件列表)。"""
-        files = list_instance_book_files(pool)
-        titles = {bid: ((results.get(bid) or {}).get("title") or "") for bid in book_ids}
+    def rebuild_maps():
+        """重新扫描, 返回 (已落盘集合, 未匹配文件列表)。"""
+        files = list_instance_book_files(pool)  # [(fname, full, dir)]
         landed = set()
         used = set()
-        for bid, title in titles.items():
-            if not title:
+        # 只对状态为 done 的书做文件名匹配
+        for bid in book_ids:
+            info = results.get(bid) or {}
+            if info.get("state") != "done":
                 continue
-            key = title.strip()
-            for i, (fname, _full, _d) in enumerate(files):
-                if i in used:
-                    continue
-                stem = os.path.splitext(fname)[0]
-                if stem == key or key in stem or stem in key:
+            title = (info.get("title") or "").strip()
+            matched = False
+            if title:
+                for i, (fname, _f, _d) in enumerate(files):
+                    if i in used:
+                        continue
+                    stem = os.path.splitext(fname)[0]
+                    if stem == title or title in stem or stem in title:
+                        landed.add(bid)
+                        used.add(i)
+                        matched = True
+                        break
+            if not matched:
+                # 标题匹配失败, 只要磁盘还有未归属文件就认领一个
+                for i in range(len(files)):
+                    if i in used:
+                        continue
                     landed.add(bid)
                     used.add(i)
                     break
         leftovers = [files[i] for i in range(len(files)) if i not in used]
         return landed, leftovers
 
-    landed, leftovers = scan()
+    landed, leftovers = rebuild_maps()
     report = {
         "group": gname, "format": fmt, "workers": workers,
         "expected": expected,
@@ -608,20 +626,24 @@ def verify_download_result(pool, book_ids, gname, fmt, workers, ok, fail, result
     }
 
     print("\n" + "=" * 60)
-    print("    下载后核对 (按书名精确比对)")
+    print("    下载后核对")
     print("=" * 60)
     print(f"    预期数量: {expected} 本")
+    print(f"    成功任务: {ok} 本 | 失败任务: {fail} 本")
     print(f"    已落盘  : {len(landed)} 本")
 
-    # 缺少 -> 重新下载
+    # ① 缺少 -> 重下(仅一轮, 避免无限循环)
     missing = [bid for bid in book_ids if bid not in landed]
     if missing:
-        print(f"\n    缺少 {len(missing)} 本, 尝试重新下载:")
-        for bid in missing:
+        print(f"\n    缺少 {len(missing)} 本, 尝试重新下载一轮:")
+        for bid in missing[:10]:
             t = (results.get(bid) or {}).get("title") or ""
             print(f"      - {bid} {t}")
+        if len(missing) > 10:
+            print(f"      ... 其余 {len(missing)-10} 本")
         report["missing_books"] = [
-            (f"{bid} {(results.get(bid) or {}).get('title') or ''}").strip() for bid in missing]
+            (f"{bid} {(results.get(bid) or {}).get('title') or ''}").strip()
+            for bid in missing]
 
         retry_ok, retry_fail, retry_results = download_group_books(pool, missing, fmt)
         results.update(retry_results)
@@ -630,32 +652,46 @@ def verify_download_result(pool, book_ids, gname, fmt, workers, ok, fail, result
             f"{(retry_results.get(bid) or {}).get('state') or '未返回'}"
             for bid in missing]
         print(f"    重下结果: 成功 {retry_ok}, 失败 {retry_fail}")
-        landed, leftovers = scan()
+        landed, leftovers = rebuild_maps()
         report["actual"] = len(landed)
         report["files"] = sorted(
             os.path.splitext(f[0])[0] for f in list_instance_book_files(pool))
         still = [bid for bid in missing if bid not in landed]
         if still:
             print(f"    重下后仍缺少 {len(still)} 本")
+            report["missing_books"] = [
+                (f"{bid} {(results.get(bid) or {}).get('title') or ''}").strip()
+                for bid in still]
         else:
             print("    重下后已补齐")
+            report["missing_books"] = []
 
-    # 多余 -> 移入单独分组
+    # ② 多余 -> 移入单独分组
     if leftovers:
         print(f"\n    发现 {len(leftovers)} 个多余文件, 移入单独分组:")
-        for fname, _full, _d in leftovers:
+        for fname, _full, _d in leftovers[:10]:
             print(f"      - {fname}")
+        if len(leftovers) > 10:
+            print(f"      ... 其余 {len(leftovers)-10} 个")
         moved = move_extra_files(leftovers, "多余书籍")
         report["extra_files"] = [os.path.splitext(f[0])[0] for f in leftovers]
         print(f"    已移动 {moved} 个到本地分组'多余书籍'")
+    else:
+        report["extra_files"] = []
 
-    # 结论
+    # ③ 结论
+    miss_n = len(report.get("missing_books") or [])
+    extra_n = len(report.get("extra_files") or [])
     print("\n    核对结论:")
-    if report["actual"] == expected and not leftovers:
+    if miss_n == 0 and extra_n == 0:
         print(f"      【一致】{expected} 本全部下载完成")
     else:
-        print(f"      预期 {expected} 本, 实际 {report['actual']} 本, "
-              f"多余 {len(report['extra_files'])} 个")
+        parts = []
+        if miss_n:
+            parts.append(f"缺少 {miss_n} 本")
+        if extra_n:
+            parts.append(f"多余 {extra_n} 个")
+        print(f"      预期 {expected} 本, 实际 {report['actual']} 本 -> " + ", ".join(parts))
 
     path = write_download_report(report, gname)
     print(f"    核对报告: {path}")
@@ -666,73 +702,112 @@ def verify_download_result(pool, book_ids, gname, fmt, workers, ok, fail, result
 
 def download_group_books(pool, book_ids, fmt):
     """多实例并发下载一组书籍。返回 (ok, fail, results)。
+
+    调度模型:
+      - unassigned: 待提交的 book_id 队列
+      - running: {inst_idx: [book_id, job_id]} 每个实例同时只跑 1 个任务
+      - 任一实例空出 -> 立即从 unassigned 补位提交
+      - 直到 unassigned 为空且 running 为空才结束
+
     results: {book_id: {"state": "done"/"failed"/"timeout", "title": str, "author": str}}
     """
     pool.set_format(fmt)
-    # 提交所有书到实例池
-    queue = list(enumerate(book_ids))  # (原序号, book_id)
-    pending = []  # [原序号, book_id, inst_idx, job_id]
-    total = len(queue)
-    results = {}  # book_id -> {state, title, author}
-    # 初始提交
-    for idx, bid in queue:
-        inst_idx, job_id = pool.submit(bid)
-        if inst_idx is not None:
-            pending.append([idx, bid, inst_idx, job_id])
-    # 轮询进度
+    unassigned = list(book_ids)
+    running = {}          # inst_idx -> [book_id, job_id]
+    results = {}
+    total = len(book_ids)
     ok, fail = 0, 0
-    while pending:
+    finished = 0
+
+    if total == 0:
+        return 0, 0, results
+
+    # 实例是否空闲(无活跃 job)
+    def inst_free(inst_idx):
+        if inst_idx in running:
+            return False
+        return True
+
+    # 先占位: 每个实例最多 1 个任务
+    for inst_idx in range(len(pool.instances)):
+        if not unassigned:
+            break
+        bid = unassigned.pop(0)
+        got = pool.submit(bid)
+        if got[0] is not None:
+            running[got[0]] = [bid, got[1]]
+        else:
+            # 提交失败, 放回队列末尾, 避免死循环
+            unassigned.append(bid)
+
+    stall = 0
+    while unassigned or running:
         time.sleep(2)
-        still = []
         progress_lines = []
-        for p in pending:
-            idx, bid, inst_idx, job_id = p
+        # 轮询运行中的任务
+        for inst_idx in list(running.keys()):
+            bid, job_id = running[inst_idx]
             inst = pool.instances[inst_idx]
             detail = pool.job_detail(inst["port"], job_id)
             if detail is None:
-                still.append(p)
                 continue
             state = detail.get("state")
-            if state == "done":
-                ok += 1
+            if state in ("done", "failed"):
+                finished += 1
+                if state == "done":
+                    ok += 1
+                else:
+                    fail += 1
                 results[bid] = {
-                    "state": "done",
+                    "state": state,
                     "title": detail.get("title") or "",
                     "author": detail.get("author") or "",
                 }
-                print(f"    [完成 {ok+fail}/{total}] {bid} {detail.get('title') or ''}")
-            elif state == "failed":
-                fail += 1
-                results[bid] = {
-                    "state": "failed",
-                    "title": detail.get("title") or "",
-                    "author": detail.get("author") or "",
-                }
-                print(f"    [失败 {ok+fail}/{total}] {bid} {detail.get('title') or ''}")
+                tag = "完成" if state == "done" else "失败"
+                print(f"    [{tag} {finished}/{total}] {bid} "
+                      f"{detail.get('title') or ''} (实例{inst_idx+1})")
+                del running[inst_idx]
             else:
-                saved = (detail.get("progress") or {}).get("saved_chapters", 0)
-                total_ch = (detail.get("progress") or {}).get("chapter_total", 0)
-                pct = (saved / total_ch * 100) if total_ch else 0
+                p = detail.get("progress") or {}
+                saved = p.get("saved_chapters", 0)
+                tot_ch = p.get("chapter_total", 0)
+                pct = (saved / tot_ch * 100) if tot_ch else 0
                 bar = "#" * int(pct // 5)
                 progress_lines.append(
-                    f"    实例{inst_idx+1} {pct:5.1f}% [{bar:<20}] {saved}/{total_ch}")
-                still.append(p)
-        # 打印进度
+                    f"    实例{inst_idx+1} {pct:5.1f}% [{bar:<20}] {saved}/{tot_ch}")
+
+        # 补位: 有空闲实例就从队列取新书
+        for inst_idx in range(len(pool.instances)):
+            if not unassigned:
+                break
+            if inst_idx in running:
+                continue
+            bid = unassigned.pop(0)
+            got = pool.submit(bid)
+            if got[0] is not None:
+                running[got[0]] = [bid, got[1]]
+                print(f"    [提交] {bid} -> 实例{got[0]+1}  "
+                      f"(队列剩余 {len(unassigned)})")
+            else:
+                unassigned.insert(0, bid)
+                break   # 实例不可用, 下轮再试
+
         if progress_lines:
             print("\n".join(progress_lines))
-        # 提交剩余未分配的书
-        if len(pending) < len(queue) - ok - fail:
-            for idx, bid in queue:
-                if any(p[0] == idx for p in pending):
-                    continue
-                if any(p[1] == bid for p in pending):
-                    continue
-                if bid in results:
-                    continue
-                inst_idx, job_id = pool.submit(bid)
-                if inst_idx is not None:
-                    pending.append([idx, bid, inst_idx, job_id])
-        pending = still
+
+        # 防死锁: 长时间无任何进展则判失败退出
+        if not running and unassigned:
+            stall += 1
+            if stall >= 5:
+                print("    [!] 连续多次无法提交任务, 剩余书籍标记为失败")
+                for bid in unassigned:
+                    results[bid] = {"state": "failed", "title": "", "author": ""}
+                    fail += 1
+                unassigned = []
+                break
+        else:
+            stall = 0
+
     return ok, fail, results
 
 

@@ -5,6 +5,7 @@ accounts.json
 # 下载器运行时产生的目录
 dl_inst_*/
 下载分组/
+下载报告/
 logs/
 
 # 下载产物

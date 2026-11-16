@@ -354,6 +354,14 @@ class DownloaderPool:
         p = it.get("progress") or {}
         return it.get("state"), p.get("saved_chapters", 0), p.get("chapter_total", 0)
 
+    def job_detail(self, port, job_id):
+        """返回完整 job 信息 dict(id/state/title/author/progress), 不存在返回 None。"""
+        j = self._req(port, f"/api/jobs?id={job_id}")
+        items = j.get("items") or []
+        if not items:
+            return None
+        return items[0]
+
     def shutdown(self):
         for inst in self.instances:
             try:
@@ -362,26 +370,239 @@ class DownloaderPool:
                 pass
 
 
+# ───────────────────────── 下载核对 / 报告 ─────────────────────────
+
+def list_instance_book_files(pool):
+    """收集所有实例目录下的书籍文件: [(文件名, 完整路径, 实例目录)]。"""
+    exts = (".txt", ".epub", ".pdf")
+    found = []
+    for inst in pool.instances:
+        d = inst["dir"]
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.lower().endswith(exts):
+                found.append((f, os.path.join(d, f), d))
+    return found
+
+
+def count_expected_files(pool):
+    """统计已生成的书籍文件数(用于数量核对)。"""
+    return len(list_instance_book_files(pool))
+
+
+def move_extra_files(extra_files, group_name="多余书籍"):
+    """把多出来的书籍文件移动到单独分组目录。返回移动数量。"""
+    if not extra_files:
+        return 0
+    dest_dir = create_local_group(group_name)
+    moved = 0
+    for _fname, full, _d in extra_files:
+        try:
+            shutil.move(full, os.path.join(dest_dir, os.path.basename(full)))
+            moved += 1
+        except Exception as e:
+            print(f"    [!] 移动多余文件失败 {os.path.basename(full)}: {e}")
+    return moved
+
+
+def write_download_report(report_data, gname):
+    """把下载核对结果写入本地 txt 报告。返回报告路径。"""
+    now = datetime.now()
+    ts_filename = now.strftime("%y%m%d%H%M%S")
+    report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "下载报告")
+    os.makedirs(report_dir, exist_ok=True)
+    path = os.path.join(report_dir, f"下载核对报告_{ts_filename}.txt")
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("番茄小说批量下载 - 下载核对报告")
+    lines.append("=" * 60)
+    lines.append(f"生成时间    : {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"书架分组    : {report_data.get('group', gname)}")
+    lines.append(f"下载格式    : {report_data.get('format', '')}")
+    lines.append(f"并发实例数  : {report_data.get('workers', '')}")
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("【数量核对】")
+    lines.append("-" * 60)
+    lines.append(f"预期下载数量: {report_data.get('expected', 0)} 本")
+    lines.append(f"实际落盘数量: {report_data.get('actual', 0)} 本")
+    lines.append(f"下载成功任务: {report_data.get('ok', 0)} 本")
+    lines.append(f"下载失败任务: {report_data.get('fail', 0)} 本")
+    missing_n = len(report_data.get("missing_books") or [])
+    extra_n = len(report_data.get("extra_files") or [])
+    if missing_n == 0 and extra_n == 0:
+        lines.append("核对结论    : 【一致】书籍数量完全匹配")
+    else:
+        parts = []
+        if missing_n:
+            parts.append(f"缺少 {missing_n} 本")
+        if extra_n:
+            parts.append(f"多余 {extra_n} 个文件")
+        lines.append("核对结论    : 【不一致】" + ", ".join(parts))
+    lines.append("")
+
+    missing = report_data.get("missing_books", [])
+    if missing:
+        lines.append("-" * 60)
+        lines.append("【缺少的书籍】")
+        lines.append("-" * 60)
+        for bid in missing:
+            lines.append(f"  - {bid}")
+        lines.append("")
+
+    extras = report_data.get("extra_files", [])
+    if extras:
+        lines.append("-" * 60)
+        lines.append("【多余的文件(已移入单独分组)】")
+        lines.append("-" * 60)
+        for name in extras:
+            lines.append(f"  - {name}")
+        lines.append("")
+
+    retried = report_data.get("retried", [])
+    if retried:
+        lines.append("-" * 60)
+        lines.append("【已尝试重新下载】")
+        lines.append("-" * 60)
+        for item in retried:
+            lines.append(f"  - {item}")
+        lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("【下载成功的书籍文件】")
+    lines.append("-" * 60)
+    files = report_data.get("files", [])
+    if files:
+        for f in files:
+            lines.append(f"  - {f}")
+    else:
+        lines.append("  (无)")
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("报告结束")
+    lines.append("=" * 60)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def verify_download_result(pool, book_ids, gname, fmt, workers, ok, fail, results):
+    """下载后精确核对。
+    results: {book_id: {state, title, author}}
+    核对依据: 每本书的 title 与磁盘文件名匹配。
+    差异处理: 多余文件移入单独分组; 缺少的书籍尝试重新下载。
+    最后输出 txt 报告。
+    """
+    expected = len(book_ids)
+
+    def scan():
+        """按标题匹配磁盘文件, 返回 (已落盘book_id集合, 未匹配文件列表)。"""
+        files = list_instance_book_files(pool)
+        titles = {bid: ((results.get(bid) or {}).get("title") or "") for bid in book_ids}
+        landed = set()
+        used = set()
+        for bid, title in titles.items():
+            if not title:
+                continue
+            key = title.strip()
+            for i, (fname, _full, _d) in enumerate(files):
+                if i in used:
+                    continue
+                stem = os.path.splitext(fname)[0]
+                if stem == key or key in stem or stem in key:
+                    landed.add(bid)
+                    used.add(i)
+                    break
+        leftovers = [files[i] for i in range(len(files)) if i not in used]
+        return landed, leftovers
+
+    landed, leftovers = scan()
+    report = {
+        "group": gname, "format": fmt, "workers": workers,
+        "expected": expected,
+        "actual": len(landed),
+        "ok": ok, "fail": fail,
+        "missing_books": [], "extra_files": [], "retried": [],
+        "files": sorted(os.path.splitext(f[0])[0] for f in list_instance_book_files(pool)),
+    }
+
+    print("\n" + "=" * 60)
+    print("    下载后核对 (按书名精确比对)")
+    print("=" * 60)
+    print(f"    预期数量: {expected} 本")
+    print(f"    已落盘  : {len(landed)} 本")
+
+    # 缺少 -> 重新下载
+    missing = [bid for bid in book_ids if bid not in landed]
+    if missing:
+        print(f"\n    缺少 {len(missing)} 本, 尝试重新下载:")
+        for bid in missing:
+            t = (results.get(bid) or {}).get("title") or ""
+            print(f"      - {bid} {t}")
+        report["missing_books"] = [
+            (f"{bid} {(results.get(bid) or {}).get('title') or ''}").strip() for bid in missing]
+
+        retry_ok, retry_fail, retry_results = download_group_books(pool, missing, fmt)
+        results.update(retry_results)
+        report["retried"] = [
+            f"{bid} {(retry_results.get(bid) or {}).get('title') or ''} -> "
+            f"{(retry_results.get(bid) or {}).get('state') or '未返回'}"
+            for bid in missing]
+        print(f"    重下结果: 成功 {retry_ok}, 失败 {retry_fail}")
+        landed, leftovers = scan()
+        report["actual"] = len(landed)
+        report["files"] = sorted(
+            os.path.splitext(f[0])[0] for f in list_instance_book_files(pool))
+        still = [bid for bid in missing if bid not in landed]
+        if still:
+            print(f"    重下后仍缺少 {len(still)} 本")
+        else:
+            print("    重下后已补齐")
+
+    # 多余 -> 移入单独分组
+    if leftovers:
+        print(f"\n    发现 {len(leftovers)} 个多余文件, 移入单独分组:")
+        for fname, _full, _d in leftovers:
+            print(f"      - {fname}")
+        moved = move_extra_files(leftovers, "多余书籍")
+        report["extra_files"] = [os.path.splitext(f[0])[0] for f in leftovers]
+        print(f"    已移动 {moved} 个到本地分组'多余书籍'")
+
+    # 结论
+    print("\n    核对结论:")
+    if report["actual"] == expected and not leftovers:
+        print(f"      【一致】{expected} 本全部下载完成")
+    else:
+        print(f"      预期 {expected} 本, 实际 {report['actual']} 本, "
+              f"多余 {len(report['extra_files'])} 个")
+
+    path = write_download_report(report, gname)
+    print(f"    核对报告: {path}")
+    return path
+
+
 # ───────────────────────── 下载流程(多实例并发) ─────────────────────────
 
 def download_group_books(pool, book_ids, fmt):
-    """多实例并发下载一组书籍。返回 (ok, fail)。"""
+    """多实例并发下载一组书籍。返回 (ok, fail, results)。
+    results: {book_id: {"state": "done"/"failed"/"timeout", "title": str, "author": str}}
+    """
     pool.set_format(fmt)
     # 提交所有书到实例池
     queue = list(enumerate(book_ids))  # (原序号, book_id)
-    pending = []  # (原序号, book_id, inst_idx, job_id)
+    pending = []  # [原序号, book_id, inst_idx, job_id]
     total = len(queue)
+    results = {}  # book_id -> {state, title, author}
     # 初始提交
     for idx, bid in queue:
         inst_idx, job_id = pool.submit(bid)
         if inst_idx is not None:
             pending.append([idx, bid, inst_idx, job_id])
-        else:
-            # 没有空闲实例, 稍后重试
-            pass
     # 轮询进度
     ok, fail = 0, 0
-    last_print = 0
     while pending:
         time.sleep(2)
         still = []
@@ -389,20 +610,34 @@ def download_group_books(pool, book_ids, fmt):
         for p in pending:
             idx, bid, inst_idx, job_id = p
             inst = pool.instances[inst_idx]
-            state, saved, total_ch = pool.job_progress(inst["port"], job_id)
-            if state is None:
+            detail = pool.job_detail(inst["port"], job_id)
+            if detail is None:
                 still.append(p)
                 continue
+            state = detail.get("state")
             if state == "done":
                 ok += 1
-                print(f"    [完成 {ok+fail}/{total}] {bid}")
+                results[bid] = {
+                    "state": "done",
+                    "title": detail.get("title") or "",
+                    "author": detail.get("author") or "",
+                }
+                print(f"    [完成 {ok+fail}/{total}] {bid} {detail.get('title') or ''}")
             elif state == "failed":
                 fail += 1
-                print(f"    [失败 {ok+fail}/{total}] {bid}")
+                results[bid] = {
+                    "state": "failed",
+                    "title": detail.get("title") or "",
+                    "author": detail.get("author") or "",
+                }
+                print(f"    [失败 {ok+fail}/{total}] {bid} {detail.get('title') or ''}")
             else:
+                saved = (detail.get("progress") or {}).get("saved_chapters", 0)
+                total_ch = (detail.get("progress") or {}).get("chapter_total", 0)
                 pct = (saved / total_ch * 100) if total_ch else 0
                 bar = "#" * int(pct // 5)
-                progress_lines.append(f"    实例{inst_idx+1} {pct:5.1f}% [{bar:<20}] {saved}/{total_ch}")
+                progress_lines.append(
+                    f"    实例{inst_idx+1} {pct:5.1f}% [{bar:<20}] {saved}/{total_ch}")
                 still.append(p)
         # 打印进度
         if progress_lines:
@@ -414,11 +649,13 @@ def download_group_books(pool, book_ids, fmt):
                     continue
                 if any(p[1] == bid for p in pending):
                     continue
+                if bid in results:
+                    continue
                 inst_idx, job_id = pool.submit(bid)
                 if inst_idx is not None:
                     pending.append([idx, bid, inst_idx, job_id])
         pending = still
-    return ok, fail
+    return ok, fail, results
 
 
 def organize_to_desktop(pool):
@@ -549,11 +786,34 @@ def func_download(pool, fmt, shelf_counter, shelf_bookmap, workers):
     if not books:
         print("    该分组没有书。")
         return
-    print(f"\n    分组'{gname}'共 {len(books)} 本, 并发实例={workers}, 格式={fmt}")
-    ok, fail = download_group_books(pool, books, fmt)
+
+    # 下载前确认总数量
+    print("\n" + "=" * 60)
+    print("    下载前确认")
+    print("=" * 60)
+    print(f"    目标分组  : {gname}")
+    print(f"    书籍总数  : {len(books)} 本")
+    print(f"    并发实例  : {workers}")
+    print(f"    输出格式  : {fmt}")
+    print("=" * 60)
+    try:
+        confirm = input("    确认开始下载? [Y/n]: ").strip().lower()
+    except EOFError:
+        confirm = "y"
+    if confirm not in ("y", "yes", ""):
+        print("    已取消下载。")
+        return
+
+    print(f"\n    开始下载分组'{gname}'共 {len(books)} 本...")
+    ok, fail, results = download_group_books(pool, books, fmt)
     print(f"\n    下载完成: 成功 {ok}, 失败 {fail}")
+    # 下载后核对(按书名精确比对 + 差异处理 + 生成txt报告)
+    report_path = verify_download_result(
+        pool, books, gname, fmt, workers, ok, fail, results)
     # 自动整理到桌面
     organize_to_desktop(pool)
+    if report_path:
+        print(f"    核对报告: {report_path}")
     # 询问是否移动到本地分组
     print("\n    是否把已下载书籍移动到本地分组?")
     try:

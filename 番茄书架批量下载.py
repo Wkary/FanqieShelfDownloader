@@ -72,6 +72,84 @@ def get_current_cookie(accounts):
     return None, ""
 
 
+# ───────────────────────── 设置管理 ─────────────────────────
+
+SETTINGS_FILE = "settings.json"
+DEFAULT_SETTINGS = {
+    "workers": 4,          # 并发下载实例数
+    "format": "txt",       # 输出格式 txt/epub/pdf
+}
+
+
+def load_settings():
+    """读取本地设置; 不存在或损坏则返回默认值。"""
+    cfg = dict(DEFAULT_SETTINGS)
+    if os.path.isfile(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if isinstance(data.get("workers"), int) and 1 <= data["workers"] <= 16:
+                    cfg["workers"] = data["workers"]
+                if data.get("format") in ("txt", "epub", "pdf"):
+                    cfg["format"] = data["format"]
+        except Exception:
+            pass
+    return cfg
+
+
+def save_settings(cfg):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def func_settings(cfg):
+    """设置菜单: 并发数 / 输出格式。返回可能被修改的 cfg。"""
+    print("\n--- 设置 ---")
+    while True:
+        print(f"    [1] 并发下载数  当前: {cfg['workers']}  (1-16)")
+        print(f"    [2] 输出格式    当前: {cfg['format']}")
+        print("    [0] 返回上级菜单")
+        try:
+            choice = input("    选择: ").strip().lower()
+        except EOFError:
+            choice = "0"
+        if choice == "1":
+            try:
+                v = input(f"    输入并发数(1-16, 当前 {cfg['workers']}): ").strip()
+            except EOFError:
+                v = ""
+            if not v:
+                print("    未修改。")
+                continue
+            if not v.isdigit() or not (1 <= int(v) <= 16):
+                print("    输入无效, 应为 1-16 的整数。")
+                continue
+            newv = int(v)
+            if newv == cfg["workers"]:
+                print("    数值未变化。")
+                continue
+            cfg["workers"] = newv
+            save_settings(cfg)
+            print(f"    并发数已设为 {newv}。")
+            print("    注意: 新并发数将在下次启动程序时生效(实例池需重建)。")
+        elif choice == "2":
+            try:
+                v = input("    输入格式(txt/epub/pdf): ").strip().lower()
+            except EOFError:
+                v = ""
+            if v not in ("txt", "epub", "pdf"):
+                print("    输入无效, 可选 txt/epub/pdf。")
+                continue
+            cfg["format"] = v
+            save_settings(cfg)
+            print(f"    输出格式已设为 {v}。")
+        elif choice == "0":
+            return cfg
+        else:
+            print("    输入无效。")
+
+
 # ───────────────────────── 番茄侧接口 ─────────────────────────
 
 def fq_get_json(path, cookie, referer=None, timeout=30):
@@ -1074,10 +1152,19 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18423)
     ap.add_argument("--password", default=None)
-    ap.add_argument("--format", default="txt", choices=["txt", "epub", "pdf"])
-    ap.add_argument("--workers", type=int, default=2, help="并发下载实例数")
+    ap.add_argument("--format", default=None, choices=["txt", "epub", "pdf"],
+                    help="输出格式(默认读设置, 首次为 txt)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="并发下载实例数(默认读设置, 首次为 4)")
     ap.add_argument("--poll", type=float, default=2.0)
     args = ap.parse_args()
+
+    # 载入本地设置(CLI 参数优先)
+    settings = load_settings()
+    if args.workers is not None:
+        settings["workers"] = max(1, min(16, args.workers))
+    if args.format:
+        settings["format"] = args.format
 
     print("=" * 60)
     print("番茄书架批量下载器 v3")
@@ -1153,8 +1240,8 @@ def main():
         print(f"      [{i}] {g}  ({c} 本)")
 
     # 启动下载器实例池
-    print(f"\n[4/4] 启动 {args.workers} 个下载器实例...")
-    pool = DownloaderPool(os.getcwd(), args.workers, args.password)
+    print(f"\n[4/4] 启动 {settings['workers']} 个下载器实例...")
+    pool = DownloaderPool(os.getcwd(), settings["workers"], args.password)
     if not pool.start():
         print("[!] 下载器实例启动失败, 退出。")
         sys.exit(5)
@@ -1162,9 +1249,10 @@ def main():
     # 主菜单
     while True:
         print("\n" + "=" * 60)
-        print("  1  下载指定分组书籍(多实例并发+进度)")
+        print("  1  下载指定分组书籍(多实例并发+进度+核对)")
         print("  2  书籍移动分组")
         print("  Z  账号设置")
+        print("  S  设置(并发数 / 输出格式)")
         print("  0  退出")
         print("=" * 60)
         try:
@@ -1178,7 +1266,8 @@ def main():
                 continue
             shelf_data = sd
             shelf_counter, shelf_bookmap = parse_shelf_groups(shelf_data)
-            func_download(pool, args.format, shelf_counter, shelf_bookmap, args.workers)
+            func_download(pool, settings["format"], shelf_counter,
+                          shelf_bookmap, settings["workers"])
         elif choice == "2":
             sd = validate_cookie(cookie)
             if not sd:
@@ -1188,6 +1277,18 @@ def main():
             func_move(cookie, shelf_data)
         elif choice == "z":
             func_account_settings(accounts)
+        elif choice == "s":
+            before = settings["workers"]
+            settings = func_settings(settings)
+            if settings["workers"] != before:
+                print("\n    并发数已变更, 正在重建下载器实例池...")
+                pool.shutdown()
+                time.sleep(1)
+                pool = DownloaderPool(os.getcwd(), settings["workers"], args.password)
+                if pool.start():
+                    print(f"    已按新并发数重建 {settings['workers']} 个实例")
+                else:
+                    print("    [!] 重建实例池失败")
         elif choice == "0":
             print("再见。")
             pool.shutdown()
